@@ -1,0 +1,53 @@
+name: Sign release artifacts (Cryptiq ML-DSA, post-quantum)
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/cryptiq-release-assets
+          gh release download "${{ github.event.release.tag_name }}" --dir /tmp/cryptiq-release-assets
+
+      - name: Sign each asset's digest via Cryptiq (ML-DSA-65, FIPS 204)
+        env:
+          CRYPTIQ_API_URL: ${{ secrets.CRYPTIQ_API_URL }}
+          CRYPTIQ_API_TOKEN: ${{ secrets.CRYPTIQ_API_TOKEN }}
+        run: |
+          # Note: signs every asset gh release download fetched above, not
+          # dist/* -- that pattern is shaped for a build-output
+          # directory (e.g. dist/*) and doesn't apply here, since release
+          # assets land flat in this temp directory regardless of where
+          # they were originally built from.
+          for asset in /tmp/cryptiq-release-assets/*; do
+            [ -e "$asset" ] || continue
+            digest=$(sha256sum "$asset" | cut -d' ' -f1)
+            curl -sS -X POST "$CRYPTIQ_API_URL/code_sign/sign/digest" \
+              -H "Authorization: Bearer $CRYPTIQ_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"sha256_hex\": \"$digest\", \"dry_run\": false}" \
+              -o "$asset.cryptiq-ml-dsa.sig.json"
+            python3 -c "
+import json,sys
+d = json.load(open('$asset.cryptiq-ml-dsa.sig.json'))
+sys.exit(0 if d.get('success') else 1)
+" || { echo "Cryptiq signing failed for $asset"; cat "$asset.cryptiq-ml-dsa.sig.json"; exit 1; }
+          done
+
+      - name: Upload signatures to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            /tmp/cryptiq-release-assets/*.cryptiq-ml-dsa.sig.json --clobber
